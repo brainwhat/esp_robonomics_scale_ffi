@@ -1,0 +1,19 @@
+[package]
+name = "robonomics_scale_ffi"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+parity-scale-codec = { version = "3.6.5", default-features = false, features = [
+    "derive",
+] }
+# For no_std environments, you might need a global allocator if you allocate
+# esp-alloc = { version = "0.3.0", optional = true } # Example allocator
+
+[lib]
+crate-type = ["staticlib"] # Crucial for creating a .a file
+
+[profile.release]
+panic = "abort" # Abort on panic for embedded
+lto = true      # Link-Time Optimization
+opt-level = "z" # Optimize for size

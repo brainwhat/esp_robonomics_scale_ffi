@@ -1,89 +1,178 @@
-#![no_std] // Indicates that we are not using the standard library
+use parity_scale_codec::{Decode, Encode};
+use std::ffi::{CStr, CString};
+use std::os::raw::c_char;
+use std::ptr;
+use std::slice;
 
-// If you need allocation (e.g., for Vec<u8>) and are using esp-alloc
-// #[cfg(feature = "esp-alloc")]
-// #[global_allocator]
-// static ALLOCATOR: esp_alloc::EspHeap = esp_alloc::EspHeap::empty();
+// --- Struct Definitions ---
 
-// fn init_heap() {
-//     #[cfg(feature = "esp-alloc")]
-//     {
-//         const HEAP_SIZE: usize = 32 * 1024; // 32KB
-//         static mut HEAP: [u8; HEAP_SIZE] = [0; HEAP_SIZE];
-//         unsafe {
-//             ALLOCATOR.init(core::ptr::addr_of_mut!(HEAP) as *mut u8, HEAP_SIZE);
-//         }
-//     }
-// }
-
-use core::ffi::{c_char, c_int, c_void};
-use core::slice;
-use parity_scale_codec::{Compact, Decode, Encode};
-
-// Example structure to encode/decode
-#[derive(Encode, Decode, Debug, PartialEq)]
-struct MyData {
-    id: u32,
-    value: Compact<u64>,
-    payload: [u8; 4],
+/// A simple struct that will be encoded and decoded.
+/// It needs to derive Encode, Decode, and typically Debug and PartialEq.
+/// Clone is added for convenience if needed, but not strictly for this FFI.
+#[derive(Encode, Decode, Debug, PartialEq, Clone)]
+struct MyStruct {
+    data: String,
 }
 
-/// Decodes data from a buffer into a MyData struct.
-/// The caller is responsible for allocating and freeing the MyDataFFI struct.
+/// Represents the result of a SCALE encoding operation.
+/// This struct is passed back to C, containing a pointer to the encoded bytes
+/// and the length of the byte buffer.
+#[repr(C)]
+pub struct ScaleEncodedResult {
+    /// Pointer to the start of the byte array.
+    /// This memory is allocated by Rust and must be freed by calling `free_scale_encoded_result`.
+    ptr: *mut u8,
+    /// Length of the byte array.
+    len: usize,
+}
+
+// --- Encoding Function ---
+
+/// Encodes a C string into the SCALE format using `MyStruct`.
 ///
-/// # Safety
-/// - `in_buffer` must be a valid pointer to a readable buffer of `buffer_len` bytes containing SCALE encoded MyData.
-/// - `out_id`, `out_value`, `out_payload_ptr` must be valid pointers to write the decoded data.
+/// # Arguments
+/// * `input_c_str`: A pointer to a null-terminated C string.
 ///
-/// Returns 0 on success, negative on error.
+/// # Returns
+/// A `ScaleEncodedResult` struct containing the pointer to the encoded bytes and their length.
+/// If input is NULL or invalid UTF-8, returns a result with a NULL pointer and 0 length.
+/// The caller is responsible for freeing the `ptr` field of the returned struct
+/// by calling `free_scale_encoded_result`.
 #[no_mangle]
-pub unsafe extern "C" fn decode_my_data(
-    in_buffer: *const u8,
-    buffer_len: usize,
-    out_id: *mut u32,
-    out_value: *mut u64,
-    out_payload_ptr: *mut u8, // Pointer to a 4-byte writable buffer
-) -> c_int {
-    if in_buffer.is_null() || out_id.is_null() || out_value.is_null() || out_payload_ptr.is_null() {
-        return -1; // Null pointer error
+pub extern "C" fn encode_string_to_scale(input_c_str: *const c_char) -> ScaleEncodedResult {
+    // Ensure the input pointer is not null
+    if input_c_str.is_null() {
+        eprintln!("Rust: encode_string_to_scale received a null input_c_str.");
+        return ScaleEncodedResult {
+            ptr: ptr::null_mut(),
+            len: 0,
+        };
     }
 
-    let input_slice = unsafe { slice::from_raw_parts(in_buffer, buffer_len) };
+    // Convert the C string to a Rust CStr
+    let c_str = unsafe { CStr::from_ptr(input_c_str) };
 
-    match MyData::decode(&mut &input_slice[..]) {
-        Ok(data) => {
-            unsafe {
-                *out_id = data.id;
-                *out_value = data.value.0; // Access inner value of Compact
-                core::ptr::copy_nonoverlapping(
-                    data.payload.as_ptr(),
-                    out_payload_ptr,
-                    data.payload.len(),
-                );
-            }
-            0 // Success
+    // Convert CStr to a Rust String
+    let rust_string = match c_str.to_str() {
+        Ok(s) => s.to_owned(),
+        Err(e) => {
+            eprintln!(
+                "Rust: Failed to convert C string to Rust string (Invalid UTF-8): {}",
+                e
+            );
+            return ScaleEncodedResult {
+                ptr: ptr::null_mut(),
+                len: 0,
+            };
         }
-        Err(_) => -2, // Decoding error
+    };
+
+    // Create an instance of MyStruct
+    let my_struct_instance = MyStruct { data: rust_string };
+
+    // Encode the struct into a Vec<u8>
+    let encoded_bytes: Vec<u8> = my_struct_instance.encode();
+
+    // Convert the Vec<u8> into a boxed slice and get its raw parts.
+    // This transfers ownership of the memory to the C caller.
+    let mut leaky_boxed_slice = encoded_bytes.into_boxed_slice();
+    let ptr = leaky_boxed_slice.as_mut_ptr();
+    let len = leaky_boxed_slice.len();
+
+    // Prevent Rust from dropping the memory when leaky_boxed_slice goes out of scope.
+    // The C code is now responsible for this memory via `free_scale_encoded_result`.
+    std::mem::forget(leaky_boxed_slice);
+
+    ScaleEncodedResult { ptr, len }
+}
+
+// --- Decoding Function ---
+
+/// Decodes SCALE encoded bytes (expected to be `MyStruct`) back into a C string.
+///
+/// # Arguments
+/// * `bytes_ptr`: A pointer to the byte array containing SCALE encoded data.
+/// * `bytes_len`: The length of the byte array.
+///
+/// # Returns
+/// A pointer to a null-terminated C string containing the decoded data.
+/// If decoding fails, or the input pointer is null, or length is 0, returns a NULL pointer.
+/// The caller is responsible for freeing the returned C string
+/// by calling `free_decoded_string`.
+#[no_mangle]
+pub extern "C" fn decode_scale_to_string(bytes_ptr: *const u8, bytes_len: usize) -> *mut c_char {
+    // Ensure the input pointer is not null and length is not zero
+    if bytes_ptr.is_null() {
+        eprintln!("Rust: decode_scale_to_string received a null bytes_ptr.");
+        return ptr::null_mut();
+    }
+    if bytes_len == 0 {
+        eprintln!("Rust: decode_scale_to_string received bytes_len of 0.");
+        return ptr::null_mut(); // Or handle as an empty struct if that's valid
+    }
+
+    // Create a Rust slice from the raw C pointer and length
+    let byte_slice = unsafe { slice::from_raw_parts(bytes_ptr, bytes_len) };
+
+    // Attempt to decode the byte slice into MyStruct
+    // Note: `&mut &byte_slice[..]` is used because `Decode::decode` expects a mutable reference to a type that implements `Input`.
+    // Slices `&[u8]` implement `Input`, so `&mut &[u8]` works.
+    match MyStruct::decode(&mut &byte_slice[..]) {
+        Ok(decoded_struct) => {
+            // Convert the decoded Rust String into a CString (null-terminated)
+            match CString::new(decoded_struct.data) {
+                Ok(c_string) => {
+                    // Transfer ownership of the CString's buffer to C.
+                    // C must call `free_decoded_string` to release this memory.
+                    c_string.into_raw()
+                }
+                Err(e) => {
+                    // This happens if the Rust string contains interior null bytes.
+                    eprintln!(
+                        "Rust: Failed to create CString (string contained null bytes): {}",
+                        e
+                    );
+                    ptr::null_mut()
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("Rust: Failed to decode MyStruct from bytes: {}", e);
+            ptr::null_mut()
+        }
     }
 }
 
-// Helper function to free memory allocated by Rust (if you were to return Vec<u8>::into_raw_parts)
-// This example doesn't directly need it if C side manages buffers, but good to know.
-// #[no_mangle]
-// pub unsafe extern "C" fn free_rust_buffer(ptr: *mut u8, len: usize, capacity: usize) {
-//     if ptr.is_null() {
-//         return;
-//     }
-//     // Reconstruct the Vec and let it drop, freeing the memory
-//     let _ = unsafe { Vec::from_raw_parts(ptr, len, capacity) };
-// }
+// --- Memory Freeing Functions ---
 
-/// Panic handler for `no_std` environments.
-/// This is required when not linking against the standard library.
-#[cfg(not(feature = "std"))]
-#[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    // On panic, loop indefinitely. You might want to trigger a specific ESP32 panic or reset.
-    // For ESP-IDF targets, you might use esp_idf_sys::esp_panic_handler
-    loop {}
+/// Frees the memory allocated by `encode_string_to_scale` for `ScaleEncodedResult`.
+///
+/// # Arguments
+/// * `result`: The `ScaleEncodedResult` struct whose `ptr` field needs to be freed.
+#[no_mangle]
+pub extern "C" fn free_scale_encoded_result(result: ScaleEncodedResult) {
+    if !result.ptr.is_null() {
+        unsafe {
+            // Reconstruct the Boxed slice from the raw parts and let Rust drop it,
+            // which deallocates the memory.
+            let _ = Box::from_raw(slice::from_raw_parts_mut(result.ptr, result.len));
+            // println!("Rust: Freed encoded result memory at {:p}", result.ptr); // For debugging
+        }
+    }
+}
+
+/// Frees the memory allocated by `decode_scale_to_string` for a C string.
+///
+/// # Arguments
+/// * `c_str_ptr`: A pointer to a C string previously returned by `decode_scale_to_string`.
+#[no_mangle]
+pub extern "C" fn free_decoded_string(c_str_ptr: *mut c_char) {
+    if !c_str_ptr.is_null() {
+        unsafe {
+            // Reconstruct the CString from the raw pointer and let Rust drop it,
+            // which deallocates the memory.
+            let _ = CString::from_raw(c_str_ptr);
+            // println!("Rust: Freed decoded string memory at {:p}", c_str_ptr); // For debugging
+        }
+    }
 }

@@ -1,19 +1,14 @@
 [package]
-name = "robonomics_scale_ffi"
+name = "rust_scale_codec_wrapper"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-parity-scale-codec = { version = "3.6.5", default-features = false, features = [
-    "derive",
-] }
-# For no_std environments, you might need a global allocator if you allocate
-# esp-alloc = { version = "0.3.0", optional = true } # Example allocator
+parity-scale-codec = { version = "3.7.5", features = ["derive"] }
 
 [lib]
-crate-type = ["staticlib"] # Crucial for creating a .a file
+name = "rust_scale_codec_wrapper"
+crate-type = ["staticlib"]
 
-[profile.release]
-panic = "abort" # Abort on panic for embedded
-lto = true      # Link-Time Optimization
-opt-level = "z" # Optimize for size
+[build-dependencies]
+cbindgen = "0.26.0"
